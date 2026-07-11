@@ -1,0 +1,71 @@
+{
+    "name": "sigilbase/sigilbase-php",
+    "description": "Official PHP client for Sigilbase: append events to tamper-evident streams and verify inclusion proofs locally.",
+    "license": "MIT",
+    "type": "library",
+    "keywords": [
+        "sigilbase",
+        "audit-log",
+        "tamper-evident",
+        "merkle",
+        "ed25519",
+        "api-client"
+    ],
+    "homepage": "https://app.sigilbase.io/docs",
+    "support": {
+        "issues": "https://github.com/sigilbase/sigilbase-php/issues",
+        "source": "https://github.com/sigilbase/sigilbase-php"
+    },
+    "require": {
+        "php": "^8.2",
+        "ext-json": "*",
+        "ext-sodium": "*",
+        "psr/http-client": "^1.0.2",
+        "psr/http-factory": "^1.0.2",
+        "psr/http-message": "^1.1 || ^2.0",
+        "psr/log": "^2.0 || ^3.0"
+    },
+    "require-dev": {
+        "guzzlehttp/guzzle": "^7.8",
+        "illuminate/contracts": "^11.0 || ^12.0",
+        "illuminate/support": "^11.0 || ^12.0",
+        "laravel/pint": "^1.18",
+        "orchestra/testbench": "^9.5 || ^10.0",
+        "pestphp/pest": "^3.5 || ^4.0",
+        "phpstan/phpstan": "^2.1"
+    },
+    "suggest": {
+        "guzzlehttp/guzzle": "Provides the PSR-18 client and PSR-17 factories the SDK discovers by default",
+        "illuminate/support": "Required to use the Laravel bridge under Sigilbase\\Laravel"
+    },
+    "autoload": {
+        "psr-4": {
+            "Sigilbase\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Sigilbase\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Sigilbase\\Laravel\\SigilbaseServiceProvider"
+            ]
+        }
+    },
+    "config": {
+        "sort-packages": true,
+        "allow-plugins": {
+            "pestphp/pest-plugin": true
+        }
+    },
+    "scripts": {
+        "test": "pest",
+        "stan": "phpstan analyse",
+        "lint": "pint"
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
