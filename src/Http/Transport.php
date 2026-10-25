@@ -17,6 +17,7 @@ use Sigilbase\Exceptions\AuthenticationException;
 use Sigilbase\Exceptions\EventNotSealedException;
 use Sigilbase\Exceptions\NotFoundException;
 use Sigilbase\Exceptions\RateLimitedException;
+use Sigilbase\Exceptions\RegistryNotReadyException;
 use Sigilbase\Exceptions\ServerException;
 use Sigilbase\Exceptions\SigilbaseException;
 use Sigilbase\Exceptions\StreamArchivedException;
@@ -60,6 +61,11 @@ final class Transport
     /**
      * @param  array<string, int|string>|null  $query
      * @param  array<string, mixed>|null  $body
+     * @param  list<int>  $passThrough  error statuses answered with their decoded body instead of an
+     *                                  exception, before any retry: a registry's recorded refusals, whose
+     *                                  receipts must be read from the body exactly as signed
+     * @param  (\Closure(?int, ?stdClass, ?string): void)|null  $observe  told of every HTTP try, retries
+     *                                                                    included: its status and decoded body, or the network error
      */
     public function request(
         string $method,
@@ -68,6 +74,8 @@ final class Transport
         ?array $body = null,
         bool $idempotent = true,
         bool $authenticated = true,
+        array $passThrough = [],
+        ?\Closure $observe = null,
     ): ApiResponse {
         $uri = $this->baseUrl.$path;
 
@@ -83,6 +91,10 @@ final class Transport
             try {
                 $response = $this->send($method, $uri, $body, $authenticated);
             } catch (ClientExceptionInterface $exception) {
+                if ($observe !== null) {
+                    $observe(null, null, $exception->getMessage());
+                }
+
                 if (! $canRetry) {
                     throw new TransportException(
                         "The request to [{$method} {$path}] failed before a response arrived: {$exception->getMessage()}",
@@ -97,6 +109,17 @@ final class Transport
             }
 
             $status = $response->getStatusCode();
+            $decoded = $observe !== null || in_array($status, $passThrough, true) ? $this->decodeObject($response) : null;
+
+            if ($observe !== null) {
+                $observe($status, $decoded, null);
+            }
+
+            if (in_array($status, $passThrough, true)) {
+                if ($decoded !== null) {
+                    return new ApiResponse($status, $decoded, $this->retryAfterSeconds($response));
+                }
+            }
 
             if (($status === 429 || $status >= 500) && $canRetry) {
                 $this->backOff($attempt, $this->retryAfterSeconds($response), $method, $path, "HTTP {$status}");
@@ -109,8 +132,19 @@ final class Transport
                 return new ApiResponse($status, $this->decodeSuccess($response, $method, $path));
             }
 
-            throw $this->mapError($status, $response);
+            throw $this->mapError($status, $this->decodeErrorBody($response), $this->retryAfterSeconds($response));
         }
+    }
+
+    /**
+     * The exception a passed-through error response maps to, exactly as if
+     * it had not been passed through.
+     */
+    public function exceptionFor(ApiResponse $response): SigilbaseException
+    {
+        $body = json_decode((string) json_encode($response->body), associative: true);
+
+        return $this->mapError($response->status, is_array($body) ? self::stringKeyed($body) : [], $response->retryAfter);
     }
 
     /**
@@ -142,15 +176,9 @@ final class Transport
 
     private function decodeSuccess(ResponseInterface $response, string $method, string $path): stdClass
     {
-        $raw = (string) $response->getBody();
+        $decoded = $this->decodeObject($response);
 
-        try {
-            $decoded = json_decode($raw, associative: false, flags: JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            $decoded = null;
-        }
-
-        if (! $decoded instanceof stdClass) {
+        if ($decoded === null) {
             throw new UnexpectedResponseException(
                 "The response to [{$method} {$path}] was not a JSON object.",
                 $response->getStatusCode(),
@@ -160,10 +188,37 @@ final class Transport
         return $decoded;
     }
 
-    private function mapError(int $status, ResponseInterface $response): SigilbaseException
+    private function decodeObject(ResponseInterface $response): ?stdClass
     {
-        $body = $this->decodeErrorBody($response);
+        try {
+            $decoded = json_decode((string) $response->getBody(), associative: false, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return null;
+        }
 
+        return $decoded instanceof stdClass ? $decoded : null;
+    }
+
+    /**
+     * @param  array<mixed>  $array
+     * @return array<string, mixed>
+     */
+    private static function stringKeyed(array $array): array
+    {
+        $keyed = [];
+
+        foreach ($array as $key => $value) {
+            $keyed[(string) $key] = $value;
+        }
+
+        return $keyed;
+    }
+
+    /**
+     * @param  array<string, mixed>  $body
+     */
+    private function mapError(int $status, array $body, ?int $retryAfter): SigilbaseException
+    {
         $code = isset($body['error']) && is_string($body['error']) ? $body['error'] : null;
         $message = isset($body['message']) && is_string($body['message'])
             ? $body['message']
@@ -183,6 +238,7 @@ final class Transport
             ),
             $status === 403 => new AccessDeniedException($message, 403, $body),
             $status === 404 => new NotFoundException($message, 404, $body),
+            $status === 409 && $code === 'registry_not_ready' => new RegistryNotReadyException($message, 409, $body),
             $status === 409 => new EventNotSealedException($message, 409, $body),
             $status === 410 => new StreamArchivedException(
                 'The stream is archived and permanently read-only (stream_archived).',
@@ -195,7 +251,7 @@ final class Transport
                 423,
                 $body,
             ),
-            $status === 429 => new RateLimitedException($message, $this->retryAfterSeconds($response), $body),
+            $status === 429 => new RateLimitedException($message, $retryAfter, $body),
             $status >= 500 => new ServerException($message, $status, $body),
             default => new UnexpectedResponseException($message, $status, $body),
         };

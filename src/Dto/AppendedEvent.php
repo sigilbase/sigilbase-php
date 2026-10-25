@@ -12,6 +12,8 @@ use stdClass;
  * The confirmation returned by an append: the durable identity of the event
  * inside the ledger. `replayed` is true when the idempotency key matched an
  * existing event and nothing new was written (HTTP 200 rather than 201).
+ * `receipt` is Sigilbase's signed receipt for the request; null with
+ * `receiptPending` while its signature is owed, signed moments later.
  */
 final readonly class AppendedEvent
 {
@@ -21,6 +23,8 @@ final readonly class AppendedEvent
         public string $entryHash,
         public string $receivedAt,
         public bool $replayed,
+        public ?Receipt $receipt = null,
+        public bool $receiptPending = false,
     ) {}
 
     /**
@@ -34,6 +38,8 @@ final readonly class AppendedEvent
             entryHash: Json::string($data, 'entry_hash'),
             receivedAt: Json::string($data, 'received_at'),
             replayed: $replayed,
+            receipt: Receipt::fromResponse($data),
+            receiptPending: ($data->receipt_pending ?? false) === true,
         );
     }
 
