@@ -9,6 +9,8 @@ use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Support\ServiceProvider;
 use InvalidArgumentException;
 use Sigilbase\Client;
+use Sigilbase\Receipts\FileAttemptLog;
+use Sigilbase\Receipts\FileReceiptStore;
 
 /**
  * Binds a configured Client into the container from config/sigilbase.php.
@@ -41,10 +43,17 @@ final class SigilbaseServiceProvider extends ServiceProvider
                 throw new InvalidArgumentException('The sigilbase.base_url config value must be a URL.');
             }
 
+            // Receipts and the attempt log are kept unless their paths are
+            // set empty: a receipt is evidence only while someone holds it.
+            $receiptsPath = $config->get('sigilbase.receipts.path');
+            $attemptLogPath = $config->get('sigilbase.receipts.attempt_log');
+
             return Client::create(
                 apiKey: $key,
                 baseUrl: $baseUrl,
                 maxRetries: is_numeric($maxRetries) ? (int) $maxRetries : 3,
+                receiptStore: is_string($receiptsPath) && $receiptsPath !== '' ? new FileReceiptStore($receiptsPath) : null,
+                attemptLog: is_string($attemptLogPath) && $attemptLogPath !== '' ? new FileAttemptLog($attemptLogPath) : null,
             );
         });
     }

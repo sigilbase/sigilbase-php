@@ -40,4 +40,23 @@ return [
 
     'max_retries' => (int) env('SIGILBASE_MAX_RETRIES', 3),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Receipts
+    |--------------------------------------------------------------------------
+    |
+    | Sigilbase signs a receipt for every request it decides. Keep them: they
+    | are your evidence of what Sigilbase told you, and the directory the
+    | open-source verifier reconciles a registry against. The attempt log
+    | records every request sent, with its digest, so attempts that never
+    | got a receipt can be told apart from decided ones. Set either path
+    | empty to switch it off.
+    |
+    */
+
+    'receipts' => [
+        'path' => env('SIGILBASE_RECEIPTS_PATH', function_exists('storage_path') ? storage_path('sigilbase/receipts') : null),
+        'attempt_log' => env('SIGILBASE_ATTEMPT_LOG', function_exists('storage_path') ? storage_path('sigilbase/attempts.ndjson') : null),
+    ],
+
 ];
