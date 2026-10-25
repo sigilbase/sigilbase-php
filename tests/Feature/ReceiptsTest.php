@@ -435,6 +435,36 @@ it('keeps every conflicting item of a batch, with its receipt', function () {
     expect(iterator_to_array((new FileReceiptStore($this->dir.'/receipts'))->all(), false))->toHaveCount(2);
 });
 
+it('finishes a conflict once, with what fetches a pending receipt later; any other 409 as its error', function () {
+    $http = new FakeHttpClient;
+    $http->queue(jsonResponse(409, [
+        'error' => 'commitment_conflict', 'message' => 'Reused.',
+        'conflicts' => [['index' => 1, 'decision_seq' => 7, 'accepted' => ['sequence' => 1, 'entry_hash' => str_repeat('ab', 32)], 'receipt' => null, 'receipt_pending' => true]],
+    ]));
+    $http->queue(jsonResponse(409, ['error' => 'registry_not_ready', 'message' => 'No policy yet.']));
+
+    $client = keepingClient($http, $this->dir);
+
+    expect(fn () => $client->stream('ledger')->appendBatch([
+        new NewEvent(actor: 'a', action: 'b', payload: [], idempotencyKey: 'k1'),
+        new NewEvent(actor: 'a', action: 'b', payload: [], idempotencyKey: 'k2'),
+    ]))->toThrow(CommitmentConflictException::class);
+
+    expect(fn () => $client->stream('filings')->append(actor: 'a', action: 'b', payload: []))
+        ->toThrow(RegistryNotReadyException::class);
+
+    $finished = array_values(array_filter(
+        (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines(),
+        static fn (array $line): bool => $line['event'] === 'finished',
+    ));
+
+    expect($finished)->toHaveCount(2)
+        ->and($finished[0]['outcome'])->toBe('conflict')
+        ->and($finished[0]['conflicts'])->toBe([['index' => 1, 'decision_seq' => 7, 'receipt_pending' => true]])
+        ->and($finished[1])->not->toHaveKey('outcome')
+        ->and($finished[1]['error'])->toContain('RegistryNotReadyException');
+});
+
 it('skips a file in the receipt folder that is not a receipt', function () {
     $store = new FileReceiptStore($this->dir.'/receipts');
     $store->put(Receipt::fromJson(receiptFixture('04-accepted.json')));
