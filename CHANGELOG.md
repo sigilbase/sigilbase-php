@@ -9,6 +9,10 @@ follows semantic versioning.
 ### Added
 
 - Receipts: `AppendedEvent::$receipt` and `$receiptPending`; `Sigilbase\Dto\Receipt`.
+- `Client::create()` options `receiptStore` and `attemptLog`, which turn both
+  on outside Laravel.
+- `StreamClient::receipt($sequence)` and `StreamClient::decisionReceipt($decisionSeq)`:
+  fetch a receipt that came back pending, and keep it in the store.
 - `ReceiptStore` with `FileReceiptStore` (default) and `SqliteReceiptStore`:
   every receipt the client is given is kept, refusals included.
 - `AttemptLog` with `FileAttemptLog`: every request sent, with its request
@@ -19,6 +23,13 @@ follows semantic versioning.
 - `StreamClient::commit()` for registry streams, returning a `CommitmentResult`
   for every recorded outcome; `RegistryNotReadyException`.
 - Laravel: `sigilbase.receipts.path` and `sigilbase.receipts.attempt_log`.
+
+### Changed
+
+- Laravel: after upgrading, the client keeps receipts in
+  `storage/sigilbase/receipts` and an attempt log in
+  `storage/sigilbase/attempts.ndjson` by default. Set `SIGILBASE_RECEIPTS_PATH`
+  or `SIGILBASE_ATTEMPT_LOG` to an empty value to turn either off.
 
 ### Fixed
 
