@@ -34,9 +34,6 @@ use Throwable;
 final class StreamClient
 {
     /**
-     * @internal
-     */
-    /**
      * Whether this stream answered as a registry, once a commit has said:
      * only then is a commit retried automatically, since only a registry
      * makes resubmitting a commitment key safe.
@@ -46,6 +43,12 @@ final class StreamClient
     /** The status of the latest HTTP response in the attempt under way. */
     private ?int $lastStatus = null;
 
+    /** @var array<string, true> attempts whose finished line is written */
+    private array $finished = [];
+
+    /**
+     * @internal
+     */
     public function __construct(
         private readonly Transport $transport,
         private readonly string $slug,
@@ -97,11 +100,7 @@ final class StreamClient
             );
 
             if ($response->status === 409) {
-                $this->finishAttempt($attempt, 409, [
-                    'outcome' => 'conflict',
-                    'decision_seq' => is_int($response->body->decision_seq ?? null) ? $response->body->decision_seq : null,
-                    'receipt_pending' => ($response->body->receipt_pending ?? false) === true,
-                ]);
+                $this->finishConflict($attempt, $response);
 
                 throw $this->conflict($response);
             }
@@ -228,6 +227,8 @@ final class StreamClient
             );
 
             if ($response->status === 409) {
+                $this->finishConflict($attempt, $response);
+
                 throw $this->conflict($response);
             }
 
@@ -516,13 +517,39 @@ final class StreamClient
     }
 
     /**
+     * A recorded key conflict's finished line: each conflict's decision_seq
+     * and whether its receipt is still owed, so a pending one can be
+     * fetched later with decisionReceipt(). Any other 409 is not a conflict
+     * and finishes as the error it maps to.
+     */
+    private function finishConflict(?string $attempt, ApiResponse $response): void
+    {
+        $body = $response->body;
+
+        if (($body->error ?? null) !== 'commitment_conflict') {
+            return;
+        }
+
+        $this->finishAttempt($attempt, 409, [
+            'outcome' => 'conflict',
+            'conflicts' => array_map(static fn (stdClass $conflict): array => array_filter([
+                'index' => is_int($conflict->index ?? null) ? $conflict->index : null,
+                'decision_seq' => is_int($conflict->decision_seq ?? null) ? $conflict->decision_seq : null,
+                'receipt_pending' => ($conflict->receipt_pending ?? false) === true,
+            ], static fn (mixed $value): bool => $value !== null), self::conflictBodies($body)),
+        ]);
+    }
+
+    /**
      * @param  array<string, mixed>  $outcome
      */
     private function finishAttempt(?string $attempt, ?int $status, array $outcome): void
     {
-        if ($attempt === null || $this->attempts === null) {
+        if ($attempt === null || $this->attempts === null || isset($this->finished[$attempt])) {
             return;
         }
+
+        $this->finished[$attempt] = true;
 
         $this->safely('attempt log', fn () => $this->attempts->finished($attempt, array_filter(
             ['status' => $status, ...$outcome],
