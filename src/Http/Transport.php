@@ -64,6 +64,8 @@ final class Transport
      * @param  list<int>  $passThrough  error statuses answered with their decoded body instead of an
      *                                  exception, before any retry: a registry's recorded refusals, whose
      *                                  receipts must be read from the body exactly as signed
+     * @param  (\Closure(?int, ?stdClass, ?string): void)|null  $observe  told of every HTTP try, retries
+     *                                                                    included: its status and decoded body, or the network error
      */
     public function request(
         string $method,
@@ -73,6 +75,7 @@ final class Transport
         bool $idempotent = true,
         bool $authenticated = true,
         array $passThrough = [],
+        ?\Closure $observe = null,
     ): ApiResponse {
         $uri = $this->baseUrl.$path;
 
@@ -88,6 +91,10 @@ final class Transport
             try {
                 $response = $this->send($method, $uri, $body, $authenticated);
             } catch (ClientExceptionInterface $exception) {
+                if ($observe !== null) {
+                    $observe(null, null, $exception->getMessage());
+                }
+
                 if (! $canRetry) {
                     throw new TransportException(
                         "The request to [{$method} {$path}] failed before a response arrived: {$exception->getMessage()}",
@@ -102,10 +109,13 @@ final class Transport
             }
 
             $status = $response->getStatusCode();
+            $decoded = $observe !== null || in_array($status, $passThrough, true) ? $this->decodeObject($response) : null;
+
+            if ($observe !== null) {
+                $observe($status, $decoded, null);
+            }
 
             if (in_array($status, $passThrough, true)) {
-                $decoded = $this->decodeObject($response);
-
                 if ($decoded !== null) {
                     return new ApiResponse($status, $decoded, $this->retryAfterSeconds($response));
                 }
@@ -122,8 +132,19 @@ final class Transport
                 return new ApiResponse($status, $this->decodeSuccess($response, $method, $path));
             }
 
-            throw $this->mapError($status, $response);
+            throw $this->mapError($status, $this->decodeErrorBody($response), $this->retryAfterSeconds($response));
         }
+    }
+
+    /**
+     * The exception a passed-through error response maps to, exactly as if
+     * it had not been passed through.
+     */
+    public function exceptionFor(ApiResponse $response): SigilbaseException
+    {
+        $body = json_decode((string) json_encode($response->body), associative: true);
+
+        return $this->mapError($response->status, is_array($body) ? self::stringKeyed($body) : [], $response->retryAfter);
     }
 
     /**
@@ -178,10 +199,26 @@ final class Transport
         return $decoded instanceof stdClass ? $decoded : null;
     }
 
-    private function mapError(int $status, ResponseInterface $response): SigilbaseException
+    /**
+     * @param  array<mixed>  $array
+     * @return array<string, mixed>
+     */
+    private static function stringKeyed(array $array): array
     {
-        $body = $this->decodeErrorBody($response);
+        $keyed = [];
 
+        foreach ($array as $key => $value) {
+            $keyed[(string) $key] = $value;
+        }
+
+        return $keyed;
+    }
+
+    /**
+     * @param  array<string, mixed>  $body
+     */
+    private function mapError(int $status, array $body, ?int $retryAfter): SigilbaseException
+    {
         $code = isset($body['error']) && is_string($body['error']) ? $body['error'] : null;
         $message = isset($body['message']) && is_string($body['message'])
             ? $body['message']
@@ -214,7 +251,7 @@ final class Transport
                 423,
                 $body,
             ),
-            $status === 429 => new RateLimitedException($message, $this->retryAfterSeconds($response), $body),
+            $status === 429 => new RateLimitedException($message, $retryAfter, $body),
             $status >= 500 => new ServerException($message, $status, $body),
             default => new UnexpectedResponseException($message, $status, $body),
         };

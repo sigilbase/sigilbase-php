@@ -11,12 +11,16 @@ use Sigilbase\Dto\ReceiptKeySet;
 use Sigilbase\Exceptions\CommitmentConflictException;
 use Sigilbase\Exceptions\RegistryNotReadyException;
 use Sigilbase\Exceptions\ServerException;
+use Sigilbase\Exceptions\TenantSuspendedException;
+use Sigilbase\Exceptions\ValidationException;
 use Sigilbase\Http\Transport;
 use Sigilbase\Receipts\FileAttemptLog;
 use Sigilbase\Receipts\FileReceiptStore;
+use Sigilbase\Receipts\ReceiptStore;
 use Sigilbase\Receipts\RequestDigest;
 use Sigilbase\Receipts\SqliteReceiptStore;
 use Sigilbase\Tests\Support\FakeHttpClient;
+use Sigilbase\Tests\Support\FakeNetworkFailure;
 use Sigilbase\Tests\Support\FakeSleeper;
 use Sigilbase\Verify\ReceiptVerifier;
 
@@ -136,9 +140,14 @@ it('keeps the receipt of every append and logs the attempt with its digest', fun
         ->and($stored[0]->id())->toBe($appended->receipt->id())
         ->and($lines[0]['event'])->toBe('started')
         ->and($lines[0]['request_digests'])->toBe([RequestDigest::of(acmeSubmission())])
-        ->and($lines[1]['event'])->toBe('finished')
-        ->and($lines[1]['id'])->toBe($lines[0]['id'])
-        ->and($lines[1]['receipt'])->toBe($appended->receipt->id());
+        ->and($lines[1]['event'])->toBe('tried')
+        ->and($lines[1]['status'])->toBe(201)
+        ->and($lines[2]['event'])->toBe('finished')
+        ->and($lines[2]['id'])->toBe($lines[0]['id'])
+        ->and($lines[2]['receipt'])->toBe($appended->receipt->id())
+        ->and($lines[2]['sequence'])->toBe(1)
+        ->and($lines[2]['outcome'])->toBe('accepted')
+        ->and($lines[2]['receipt_pending'])->toBeFalse();
 });
 
 it('says when a receipt is still owed', function () {
@@ -275,3 +284,140 @@ it('keeps receipts in SQLite too', function () {
         ->and($all[0]->signature)->toBe($receipt->signature)
         ->and($all[0]->id())->toBe($receipt->id());
 })->skip(fn () => ! extension_loaded('pdo_sqlite'), 'ext-pdo_sqlite is not loaded');
+
+it('says plainly when a commit went to a stream that is not a registry', function () {
+    $http = new FakeHttpClient;
+    $receipt = json_decode(receiptFixture('04-accepted.json'));
+    $http->queue(rawJsonResponse(201, json_encode([
+        'id' => 'e1', 'sequence' => 7, 'entry_hash' => str_repeat('ab', 32), 'received_at' => '2026-07-01T09:10:00.000000Z',
+        'receipt' => $receipt, 'receipt_pending' => false,
+    ])));
+
+    $result = keepingClient($http, $this->dir)->stream('ledger')->commit('acme-q3', 'a', 'b', []);
+
+    expect($result->registry)->toBeFalse()
+        ->and($result->sequence)->toBe(7)
+        ->and($result->receipt)->not->toBeNull()
+        ->and(iterator_to_array((new FileReceiptStore($this->dir.'/receipts'))->all(), false))->toHaveCount(1);
+});
+
+it('maps a commit refused before any decision like an append', function () {
+    $http = new FakeHttpClient;
+    $http->queue(jsonResponse(403, ['error' => 'tenant_suspended']));
+
+    expect(fn () => keepingClient($http, $this->dir)->stream('filings')->commit('k', 'a', 'b', []))
+        ->toThrow(TenantSuspendedException::class);
+});
+
+it('keeps the receipt a registry signs for an append it refuses', function () {
+    $http = new FakeHttpClient;
+    $receipt = json_decode(receiptFixture('06-conflict.json'));
+    $http->queue(rawJsonResponse(422, json_encode([
+        'outcome' => 'invalid', 'error' => 'invalid', 'message' => 'Refused.', 'reasons' => ['unexpected_field'],
+        'decision_seq' => 9, 'recorded' => true, 'receipt' => $receipt, 'receipt_pending' => false,
+    ])));
+
+    expect(fn () => keepingClient($http, $this->dir)->stream('filings')->append(actor: 'a', action: 'b', payload: []))
+        ->toThrow(ValidationException::class);
+
+    $lines = (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines();
+
+    expect(iterator_to_array((new FileReceiptStore($this->dir.'/receipts'))->all(), false))->toHaveCount(1)
+        ->and($lines[count($lines) - 1]['event'])->toBe('finished')
+        ->and($lines[count($lines) - 1]['status'])->toBe(422);
+});
+
+it('still ends the attempt when the receipt store cannot write', function () {
+    $http = new FakeHttpClient;
+    $receipt = json_decode(receiptFixture('04-accepted.json'));
+    $http->queue(rawJsonResponse(201, json_encode([
+        'id' => 'e1', 'sequence' => 1, 'entry_hash' => str_repeat('ab', 32), 'received_at' => '2026-07-01T09:10:00.000000Z',
+        'receipt' => $receipt, 'receipt_pending' => false,
+    ])));
+
+    $failing = new class implements ReceiptStore
+    {
+        public function put(Receipt $receipt): void
+        {
+            throw new RuntimeException('disk full');
+        }
+
+        public function all(): iterable
+        {
+            return [];
+        }
+    };
+
+    $factory = new HttpFactory;
+    $client = new Client(new Transport($http, $factory, $factory, 'https://sigilbase.test', 'sgb_x.y', sleeper: new FakeSleeper), $failing, new FileAttemptLog($this->dir.'/attempts.ndjson'));
+
+    expect(fn () => $client->stream('ledger')->append(actor: 'a', action: 'b', payload: []))->toThrow(RuntimeException::class, 'disk full');
+
+    $lines = (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines();
+
+    expect(array_column($lines, 'event'))->toBe(['started', 'tried', 'finished'])
+        ->and($lines[1]['status'])->toBe(201)
+        ->and($lines[2]['error'])->toContain('disk full');
+});
+
+it('logs every try of an attempt, retries included', function () {
+    $http = new FakeHttpClient;
+    $http->queue(new FakeNetworkFailure('connection reset'));
+    $http->queue(jsonResponse(200, ['id' => 'e1', 'sequence' => 1, 'entry_hash' => str_repeat('ab', 32), 'received_at' => '2026-07-01T09:10:00.000000Z']));
+
+    keepingClient($http, $this->dir)->stream('ledger')->append(actor: 'a', action: 'b', payload: [], idempotencyKey: 'k');
+
+    $lines = (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines();
+
+    expect(array_column($lines, 'event'))->toBe(['started', 'tried', 'tried', 'finished'])
+        ->and($lines[1])->toHaveKey('error')
+        ->and($lines[2]['status'])->toBe(200);
+});
+
+it('fetches a receipt owed earlier, and keeps it', function () {
+    $http = new FakeHttpClient;
+    $http->queue(rawJsonResponse(200, json_encode(['receipt' => json_decode(receiptFixture('04-accepted.json')), 'receipt_pending' => false])));
+    $http->queue(jsonResponse(202, ['receipt' => null, 'receipt_pending' => true]));
+
+    $client = keepingClient($http, $this->dir);
+
+    expect($client->stream('filings')->receipt(1)?->outcome())->toBe('accepted')
+        ->and((string) $http->lastRequest()->getUri())->toBe('https://sigilbase.test/api/v1/streams/filings/events/1/receipt')
+        ->and($client->stream('filings')->decisionReceipt(4))->toBeNull()
+        ->and((string) $http->lastRequest()->getUri())->toBe('https://sigilbase.test/api/v1/streams/filings/decisions/4/receipt')
+        ->and(iterator_to_array((new FileReceiptStore($this->dir.'/receipts'))->all(), false))->toHaveCount(1);
+});
+
+it('keeps every conflicting item of a batch, with its receipt', function () {
+    $http = new FakeHttpClient;
+    $conflict = json_decode(receiptFixture('06-conflict.json'));
+    $accepted = json_decode(receiptFixture('04-accepted.json'));
+    $http->queue(rawJsonResponse(409, json_encode([
+        'error' => 'commitment_conflict', 'message' => 'Reused.',
+        'conflicts' => [
+            ['index' => 0, 'decision_seq' => 5, 'accepted' => ['sequence' => 1, 'entry_hash' => str_repeat('ab', 32)], 'receipt' => $conflict, 'receipt_pending' => false],
+            ['index' => 2, 'decision_seq' => 6, 'accepted' => ['sequence' => 2, 'entry_hash' => str_repeat('cd', 32)], 'receipt' => $accepted, 'receipt_pending' => false],
+        ],
+    ])));
+
+    try {
+        keepingClient($http, $this->dir)->stream('ledger')->appendBatch([
+            new NewEvent(actor: 'a', action: 'b', payload: [], idempotencyKey: 'k1'),
+            new NewEvent(actor: 'a', action: 'b', payload: [], idempotencyKey: 'k2'),
+            new NewEvent(actor: 'a', action: 'b', payload: [], idempotencyKey: 'k3'),
+        ]);
+        $this->fail('expected a conflict');
+    } catch (CommitmentConflictException $exception) {
+        expect($exception->receipts)->toHaveCount(2)->and($exception->decisionSeq)->toBeNull();
+    }
+
+    expect(iterator_to_array((new FileReceiptStore($this->dir.'/receipts'))->all(), false))->toHaveCount(2);
+});
+
+it('skips a file in the receipt folder that is not a receipt', function () {
+    $store = new FileReceiptStore($this->dir.'/receipts');
+    $store->put(Receipt::fromJson(receiptFixture('04-accepted.json')));
+    file_put_contents($this->dir.'/receipts/zz-broken.json', '{not json');
+
+    expect(iterator_to_array($store->all(), false))->toHaveCount(1);
+});

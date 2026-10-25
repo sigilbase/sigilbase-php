@@ -16,9 +16,7 @@ use Sigilbase\Dto\NewEvent;
 use Sigilbase\Dto\Receipt;
 use Sigilbase\Exceptions\ApiException;
 use Sigilbase\Exceptions\CommitmentConflictException;
-use Sigilbase\Exceptions\RegistryNotReadyException;
 use Sigilbase\Exceptions\SigilbaseException;
-use Sigilbase\Exceptions\UnexpectedResponseException;
 use Sigilbase\Http\ApiResponse;
 use Sigilbase\Http\Transport;
 use Sigilbase\Internal\Json;
@@ -26,6 +24,7 @@ use Sigilbase\Receipts\AttemptLog;
 use Sigilbase\Receipts\ReceiptStore;
 use Sigilbase\Receipts\RequestDigest;
 use stdClass;
+use Throwable;
 
 /**
  * Operations on one stream. Obtain via {@see Client::stream()}.
@@ -74,23 +73,30 @@ final class StreamClient
     {
         $attempt = $this->startAttempt([RequestDigest::of($event)], ['idempotency_key' => $event->idempotencyKey]);
 
-        $response = $this->send($attempt, fn (): ApiResponse => $this->transport->request(
-            'POST',
-            $this->path('/events'),
-            body: $event->toRequestBody(),
-            idempotent: $event->idempotencyKey !== null,
-            passThrough: [409],
-        ));
+        return $this->attempt($attempt, function () use ($attempt, $event): AppendedEvent {
+            $response = $this->transport->request(
+                'POST',
+                $this->path('/events'),
+                body: $event->toRequestBody(),
+                idempotent: $event->idempotencyKey !== null,
+                passThrough: [409],
+                observe: $this->observer($attempt),
+            );
 
-        if ($response->status === 409) {
-            throw $this->conflict($attempt, $response);
-        }
+            if ($response->status === 409) {
+                throw $this->conflict($response);
+            }
 
-        $appended = AppendedEvent::fromObject($response->body, replayed: $response->status === 200);
-        $this->keep($appended->receipt);
-        $this->finishAttempt($attempt, $response->status, $appended->receipt, $appended->receipt === null ? null : $appended->receipt->outcome());
+            $appended = AppendedEvent::fromObject($response->body, replayed: $response->status === 200);
+            $this->finishAttempt($attempt, $response->status, [
+                'outcome' => $appended->receipt?->outcome() ?? ($appended->replayed ? 'replay' : 'accepted'),
+                'sequence' => $appended->sequence,
+                'receipt' => $appended->receipt?->id(),
+                'receipt_pending' => $appended->receiptPending,
+            ]);
 
-        return $appended;
+            return $appended;
+        });
     }
 
     /**
@@ -99,8 +105,14 @@ final class StreamClient
      * refusal comes back as a result, not an exception: `outcome` says what
      * was decided, and the receipt is kept in the client's receipt store.
      * Only what was not decided throws: an authentication failure, a
-     * registry with no policy yet, or one that could not decide (retried, as
-     * a commitment key makes a submission safe to repeat).
+     * suspended workspace, a registry with no policy yet, or one that could
+     * not decide (retried, as a commitment key makes a submission safe to
+     * repeat).
+     *
+     * Sent to a stream that is not a registry, the commitment key is ignored
+     * and the event is appended like any other: the result says so
+     * (`registry` false), with the event and its receipt. Such a stream does
+     * not make a resubmission safe; send to registries only.
      *
      * @param  array<string, mixed>|stdClass  $payload
      */
@@ -115,30 +127,36 @@ final class StreamClient
         $event = new NewEvent(actor: $actor, action: $action, payload: $payload, occurredAt: $occurredAt, resource: $resource);
         $attempt = $this->startAttempt([RequestDigest::of($event, $commitmentKey)], ['commitment_key' => $commitmentKey]);
 
-        $response = $this->send($attempt, fn (): ApiResponse => $this->transport->request(
-            'POST',
-            $this->path('/events'),
-            body: ['commitment_key' => $commitmentKey, ...$event->toRequestBody()],
-            idempotent: true,
-            passThrough: [403, 409, 410, 422, 423, 429],
-        ));
+        return $this->attempt($attempt, function () use ($attempt, $commitmentKey, $event): CommitmentResult {
+            $response = $this->transport->request(
+                'POST',
+                $this->path('/events'),
+                body: ['commitment_key' => $commitmentKey, ...$event->toRequestBody()],
+                idempotent: true,
+                passThrough: [403, 409, 410, 422, 423, 429],
+                observe: $this->observer($attempt),
+            );
 
-        if (! is_string($response->body->outcome ?? null)) {
-            $message = is_string($response->body->message ?? null) ? $response->body->message : "Sigilbase returned HTTP {$response->status}.";
-            $exception = ($response->body->error ?? null) === 'registry_not_ready'
-                ? new RegistryNotReadyException($message, $response->status, (array) $response->body)
-                : new UnexpectedResponseException($message, $response->status, (array) $response->body);
+            if (! is_string($response->body->outcome ?? null)) {
+                if ($response->status >= 200 && $response->status < 300) {
+                    // A standard stream: appended, its key ignored.
+                    $result = CommitmentResult::fromStandardAppend($response->status, $response->body);
+                } else {
+                    throw $this->transport->exceptionFor($response);
+                }
+            } else {
+                $result = CommitmentResult::fromResponse($response->status, $response->body, $response->retryAfter);
+            }
 
-            $this->finishAttempt($attempt, $response->status, null, null, $exception->getMessage());
+            $this->finishAttempt($attempt, $response->status, [
+                'outcome' => $result->outcome,
+                'decision_seq' => $result->decisionSeq,
+                'sequence' => $result->sequence,
+                'receipt' => $result->receipt?->id(),
+            ]);
 
-            throw $exception;
-        }
-
-        $result = CommitmentResult::fromResponse($response->status, $response->body, $response->retryAfter);
-        $this->keep($result->receipt);
-        $this->finishAttempt($attempt, $response->status, $result->receipt, $result->outcome);
-
-        return $result;
+            return $result;
+        });
     }
 
     /**
@@ -172,35 +190,57 @@ final class StreamClient
             ['batch' => $count],
         );
 
-        $response = $this->send($attempt, fn (): ApiResponse => $this->transport->request(
-            'POST',
-            $this->path('/events:batch'),
-            body: ['events' => array_map(
-                static fn (NewEvent $event): array => $event->toRequestBody(),
-                $events,
-            )],
-            idempotent: $idempotent,
-            passThrough: [409],
-        ));
+        return $this->attempt($attempt, function () use ($attempt, $events, $idempotent): array {
+            $response = $this->transport->request(
+                'POST',
+                $this->path('/events:batch'),
+                body: ['events' => array_map(
+                    static fn (NewEvent $event): array => $event->toRequestBody(),
+                    $events,
+                )],
+                idempotent: $idempotent,
+                passThrough: [409],
+                observe: $this->observer($attempt),
+            );
 
-        if ($response->status === 409) {
-            throw $this->conflict($attempt, $response);
-        }
+            if ($response->status === 409) {
+                throw $this->conflict($response);
+            }
 
-        $replayed = $response->status === 200;
+            $replayed = $response->status === 200;
 
-        $appended = array_map(
-            static fn (stdClass $confirmation): AppendedEvent => AppendedEvent::fromObject($confirmation, $replayed),
-            Json::objectList($response->body, 'events'),
-        );
+            $appended = array_map(
+                static fn (stdClass $confirmation): AppendedEvent => AppendedEvent::fromObject($confirmation, $replayed),
+                Json::objectList($response->body, 'events'),
+            );
 
-        foreach ($appended as $confirmation) {
-            $this->keep($confirmation->receipt);
-        }
+            $this->finishAttempt($attempt, $response->status, [
+                'outcomes' => array_map(static fn (AppendedEvent $confirmation): string => $confirmation->receipt?->outcome() ?? ($confirmation->replayed ? 'replay' : 'accepted'), $appended),
+                'sequences' => array_map(static fn (AppendedEvent $confirmation): int => $confirmation->sequence, $appended),
+                'receipts' => array_map(static fn (AppendedEvent $confirmation): ?string => $confirmation->receipt?->id(), $appended),
+            ]);
 
-        $this->finishAttempt($attempt, $response->status, null, $replayed ? 'replay' : 'accepted');
+            return $appended;
+        });
+    }
 
-        return $appended;
+    /**
+     * The stored receipt for an event, as GET .../events/{sequence}/receipt
+     * serves it: the same bytes on every fetch. Null while its signature is
+     * still owed (receipt_pending). A receipt fetched is kept like any other.
+     */
+    public function receipt(int $sequence): ?Receipt
+    {
+        return $this->fetchReceipt($this->path("/events/{$sequence}/receipt"));
+    }
+
+    /**
+     * The receipt for a recorded decision, as GET .../decisions/{seq}/receipt
+     * serves it; null while its signature is owed.
+     */
+    public function decisionReceipt(int $decisionSeq): ?Receipt
+    {
+        return $this->fetchReceipt($this->path("/decisions/{$decisionSeq}/receipt"));
     }
 
     /**
@@ -272,46 +312,99 @@ final class StreamClient
     }
 
     /**
-     * A key-conflict 409, its receipts kept: a single append's, or one per
-     * conflicting batch item.
+     * A key-conflict 409. Its receipts were kept as the response arrived
+     * (the observer); this builds the exception, with every conflict's
+     * receipt when a batch conflicted. Any other 409 is mapped as the
+     * transport maps it (registry_not_ready, for one).
      */
-    private function conflict(?string $attempt, ApiResponse $response): SigilbaseException
+    private function conflict(ApiResponse $response): SigilbaseException
     {
         $body = $response->body;
 
         if (($body->error ?? null) !== 'commitment_conflict') {
-            $message = is_string($body->message ?? null) ? $body->message : 'Sigilbase returned HTTP 409.';
-            $this->finishAttempt($attempt, 409, null, null, $message);
-
-            return new UnexpectedResponseException($message, 409, (array) $body);
+            return $this->transport->exceptionFor($response);
         }
 
-        $conflicts = isset($body->conflicts) && is_array($body->conflicts) ? $body->conflicts : [$body];
-        $first = null;
+        $receipts = [];
 
-        foreach ($conflicts as $conflict) {
-            if ($conflict instanceof stdClass) {
-                $receipt = Receipt::fromResponse($conflict);
-                $this->keep($receipt);
-                $first ??= $receipt;
+        foreach (self::conflictBodies($body) as $conflict) {
+            $receipt = Receipt::fromResponse($conflict);
+
+            if ($receipt !== null) {
+                $receipts[] = $receipt;
             }
         }
-
-        $this->finishAttempt($attempt, 409, $first, 'conflict');
 
         return new CommitmentConflictException(
             is_string($body->message ?? null) ? $body->message : 'This idempotency key already belongs to an event with different content.',
             get_object_vars($body),
             is_int($body->decision_seq ?? null) ? $body->decision_seq : null,
-            $first,
+            $receipts[0] ?? null,
+            $receipts,
         );
     }
 
-    private function keep(?Receipt $receipt): void
+    /**
+     * The objects of a response that may carry a receipt: the body itself,
+     * or each conflict of a batch.
+     *
+     * @return list<stdClass>
+     */
+    private static function conflictBodies(stdClass $body): array
     {
+        if (isset($body->conflicts) && is_array($body->conflicts)) {
+            return array_values(array_filter($body->conflicts, static fn (mixed $conflict): bool => $conflict instanceof stdClass));
+        }
+
+        if (isset($body->events) && is_array($body->events)) {
+            return array_values(array_filter($body->events, static fn (mixed $confirmation): bool => $confirmation instanceof stdClass));
+        }
+
+        return [$body];
+    }
+
+    private function fetchReceipt(string $path): ?Receipt
+    {
+        $response = $this->transport->request('GET', $path);
+        $receipt = Receipt::fromResponse($response->body);
+
         if ($receipt !== null) {
             $this->receipts?->put($receipt);
         }
+
+        return $receipt;
+    }
+
+    /**
+     * Called by the transport for every HTTP try of an attempt, retries
+     * included: logs the try, then keeps any receipt the response carries,
+     * whatever its status, before the response is mapped or retried. A
+     * registry signs a receipt for a refusal too (a 422, a recorded 429).
+     *
+     * @return \Closure(?int, ?stdClass, ?string): void
+     */
+    private function observer(?string $attempt): \Closure
+    {
+        return function (?int $status, ?stdClass $body, ?string $error) use ($attempt): void {
+            if ($attempt !== null && $this->attempts !== null) {
+                $this->attempts->tried($attempt, array_filter([
+                    'status' => $status,
+                    'error' => $error,
+                ], static fn (mixed $value): bool => $value !== null));
+            }
+
+            if ($body === null || $this->receipts === null) {
+                return;
+            }
+
+            foreach (self::conflictBodies($body) as $carrier) {
+                $receipt = Receipt::fromResponse($carrier);
+
+                if ($receipt !== null) {
+                    $this->receipts->put($receipt);
+                }
+            }
+        };
     }
 
     /**
@@ -338,32 +431,42 @@ final class StreamClient
     }
 
     /**
-     * @param  callable(): ApiResponse  $send
+     * Run an attempt: whatever ends it, an answer or anything thrown on the
+     * way (a mapped error, a malformed body, a receipt store that cannot
+     * write), its finished line is written first. An attempt that never
+     * finishes in the log is one this process never saw end.
+     *
+     * @template T
+     *
+     * @param  callable(): T  $work
+     * @return T
      */
-    private function send(?string $attempt, callable $send): ApiResponse
+    private function attempt(?string $attempt, callable $work): mixed
     {
         try {
-            return $send();
-        } catch (SigilbaseException $exception) {
-            $this->finishAttempt($attempt, $exception instanceof ApiException ? $exception->status : null, null, null, $exception->getMessage());
+            return $work();
+        } catch (Throwable $exception) {
+            $this->finishAttempt($attempt, $exception instanceof ApiException ? $exception->status : null, [
+                'error' => $exception::class.': '.$exception->getMessage(),
+            ]);
 
             throw $exception;
         }
     }
 
-    private function finishAttempt(?string $attempt, ?int $status, ?Receipt $receipt, ?string $outcome, ?string $error = null): void
+    /**
+     * @param  array<string, mixed>  $outcome
+     */
+    private function finishAttempt(?string $attempt, ?int $status, array $outcome): void
     {
         if ($attempt === null || $this->attempts === null) {
             return;
         }
 
-        $this->attempts->finished($attempt, array_filter([
-            'status' => $status,
-            'outcome' => $outcome,
-            'decision_seq' => $receipt?->decisionSeq(),
-            'receipt' => $receipt?->id(),
-            'error' => $error,
-        ], static fn (mixed $value): bool => $value !== null));
+        $this->attempts->finished($attempt, array_filter(
+            ['status' => $status, ...$outcome],
+            static fn (mixed $value): bool => $value !== null,
+        ));
     }
 
     private function path(string $suffix): string

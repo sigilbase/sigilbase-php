@@ -47,7 +47,12 @@ final class FileReceiptStore implements ReceiptStore
         sort($files, SORT_STRING);
 
         foreach ($files as $file) {
-            $receipt = Receipt::fromJson((string) file_get_contents($file));
+            // A file in the folder that is not a receipt is not one of ours.
+            try {
+                $receipt = Receipt::fromJson((string) file_get_contents($file));
+            } catch (\JsonException) {
+                continue;
+            }
 
             if ($receipt !== null) {
                 yield $receipt;

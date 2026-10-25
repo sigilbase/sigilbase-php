@@ -8,8 +8,9 @@ use RuntimeException;
 
 /**
  * The attempt log as an append-only file of JSON lines: a `started` line
- * written before each request is sent and a `finished` line when it is
- * answered or fails, joined by the attempt's id. An attempt with no
+ * written before each request is sent, a `tried` line for each HTTP try
+ * (retries included), and a `finished` line when it is answered or fails,
+ * joined by the attempt's id. An attempt with no
  * `finished` line, or one finished with an error and no receipt, is a
  * request Sigilbase may never have received.
  */
@@ -27,6 +28,11 @@ final class FileAttemptLog implements AttemptLog
     public function started(array $attempt): void
     {
         $this->append(['event' => 'started', ...$attempt]);
+    }
+
+    public function tried(string $attemptId, array $try): void
+    {
+        $this->append(['event' => 'tried', 'id' => $attemptId, 'at' => gmdate('Y-m-d\TH:i:s\Z'), ...$try]);
     }
 
     public function finished(string $attemptId, array $outcome): void
