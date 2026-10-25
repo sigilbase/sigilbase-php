@@ -48,10 +48,11 @@ final class FileAttemptLog implements AttemptLog
         $lines = [];
 
         foreach (file($this->path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
-            $decoded = json_decode($line, associative: true);
+            $decoded = json_decode($line, associative: false);
 
-            if (is_array($decoded)) {
-                $lines[] = $decoded;
+            // Each line is a flat object of scalars and lists.
+            if ($decoded instanceof \stdClass) {
+                $lines[] = get_object_vars($decoded);
             }
         }
 
