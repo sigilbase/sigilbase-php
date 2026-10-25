@@ -7,6 +7,8 @@ namespace Sigilbase;
 use DateTimeInterface;
 use Generator;
 use InvalidArgumentException;
+use Psr\Log\LoggerInterface;
+use Psr\Log\NullLogger;
 use Sigilbase\Dto\AppendedEvent;
 use Sigilbase\Dto\Checkpoint;
 use Sigilbase\Dto\CommitmentResult;
@@ -34,11 +36,22 @@ final class StreamClient
     /**
      * @internal
      */
+    /**
+     * Whether this stream answered as a registry, once a commit has said:
+     * only then is a commit retried automatically, since only a registry
+     * makes resubmitting a commitment key safe.
+     */
+    private ?bool $registry = null;
+
+    /** The status of the latest HTTP response in the attempt under way. */
+    private ?int $lastStatus = null;
+
     public function __construct(
         private readonly Transport $transport,
         private readonly string $slug,
         private readonly ?ReceiptStore $receipts = null,
         private readonly ?AttemptLog $attempts = null,
+        private readonly LoggerInterface $logger = new NullLogger,
     ) {}
 
     /**
@@ -84,6 +97,12 @@ final class StreamClient
             );
 
             if ($response->status === 409) {
+                $this->finishAttempt($attempt, 409, [
+                    'outcome' => 'conflict',
+                    'decision_seq' => is_int($response->body->decision_seq ?? null) ? $response->body->decision_seq : null,
+                    'receipt_pending' => ($response->body->receipt_pending ?? false) === true,
+                ]);
+
                 throw $this->conflict($response);
             }
 
@@ -132,7 +151,9 @@ final class StreamClient
                 'POST',
                 $this->path('/events'),
                 body: ['commitment_key' => $commitmentKey, ...$event->toRequestBody()],
-                idempotent: true,
+                // Safe to repeat only on a registry: until this stream has
+                // answered as one, a lost answer is the caller's to retry.
+                idempotent: $this->registry === true,
                 passThrough: [403, 409, 410, 422, 423, 429],
                 observe: $this->observer($attempt),
             );
@@ -140,11 +161,13 @@ final class StreamClient
             if (! is_string($response->body->outcome ?? null)) {
                 if ($response->status >= 200 && $response->status < 300) {
                     // A standard stream: appended, its key ignored.
+                    $this->registry = false;
                     $result = CommitmentResult::fromStandardAppend($response->status, $response->body);
                 } else {
                     throw $this->transport->exceptionFor($response);
                 }
             } else {
+                $this->registry = true;
                 $result = CommitmentResult::fromResponse($response->status, $response->body, $response->retryAfter);
             }
 
@@ -153,6 +176,7 @@ final class StreamClient
                 'decision_seq' => $result->decisionSeq,
                 'sequence' => $result->sequence,
                 'receipt' => $result->receipt?->id(),
+                'receipt_pending' => $result->receipt === null && ($response->body->receipt_pending ?? false) === true,
             ]);
 
             return $result;
@@ -368,11 +392,41 @@ final class StreamClient
         $response = $this->transport->request('GET', $path);
         $receipt = Receipt::fromResponse($response->body);
 
-        if ($receipt !== null) {
-            $this->receipts?->put($receipt);
+        if ($receipt !== null && $this->receipts !== null) {
+            $this->safely('receipt store', fn () => $this->receipts->put($receipt));
         }
 
         return $receipt;
+    }
+
+    /**
+     * Local bookkeeping (the receipt store, the attempt log) never fails a
+     * request Sigilbase has already decided: that would hand the caller an
+     * exception for a write that happened, and invite a retry that
+     * duplicates it. The receipt is still on the result the caller gets;
+     * the failure is logged as an error, and noted in the attempt log when
+     * that still works.
+     *
+     * @param  callable(): mixed  $write
+     */
+    private function safely(string $what, callable $write, ?string $attempt = null): void
+    {
+        try {
+            $write();
+        } catch (Throwable $exception) {
+            $this->logger->error("Sigilbase {$what} could not be written; the request itself succeeded", [
+                'stream' => $this->slug,
+                'exception' => $exception->getMessage(),
+            ]);
+
+            if ($attempt !== null && $what !== 'attempt log' && $this->attempts !== null) {
+                try {
+                    $this->attempts->tried($attempt, ['local_error' => "{$what}: {$exception->getMessage()}"]);
+                } catch (Throwable) {
+                    // Both local stores failing is already logged above.
+                }
+            }
+        }
     }
 
     /**
@@ -386,14 +440,18 @@ final class StreamClient
     private function observer(?string $attempt): \Closure
     {
         return function (?int $status, ?stdClass $body, ?string $error) use ($attempt): void {
+            $this->lastStatus = $status ?? $this->lastStatus;
+
             if ($attempt !== null && $this->attempts !== null) {
-                $this->attempts->tried($attempt, array_filter([
+                $this->safely('attempt log', fn () => $this->attempts->tried($attempt, array_filter([
                     'status' => $status,
                     'error' => $error,
-                ], static fn (mixed $value): bool => $value !== null));
+                ], static fn (mixed $value): bool => $value !== null)));
             }
 
-            if ($body === null || $this->receipts === null) {
+            $store = $this->receipts;
+
+            if ($body === null || $store === null) {
                 return;
             }
 
@@ -401,7 +459,7 @@ final class StreamClient
                 $receipt = Receipt::fromResponse($carrier);
 
                 if ($receipt !== null) {
-                    $this->receipts->put($receipt);
+                    $this->safely('receipt store', fn () => $store->put($receipt), $attempt);
                 }
             }
         };
@@ -418,14 +476,15 @@ final class StreamClient
         }
 
         $id = bin2hex(random_bytes(16));
+        $this->lastStatus = null;
 
-        $this->attempts->started([
+        $this->safely('attempt log', fn () => $this->attempts->started([
             'id' => $id,
             'stream' => $this->slug,
             'request_digests' => $digests,
             ...array_filter($keys, static fn (mixed $value): bool => $value !== null),
             'sent_at' => gmdate('Y-m-d\TH:i:s\Z'),
-        ]);
+        ]));
 
         return $id;
     }
@@ -446,7 +505,9 @@ final class StreamClient
         try {
             return $work();
         } catch (Throwable $exception) {
-            $this->finishAttempt($attempt, $exception instanceof ApiException ? $exception->status : null, [
+            $status = $exception instanceof ApiException && $exception->status > 0 ? $exception->status : $this->lastStatus;
+
+            $this->finishAttempt($attempt, $status, [
                 'error' => $exception::class.': '.$exception->getMessage(),
             ]);
 
@@ -463,10 +524,10 @@ final class StreamClient
             return;
         }
 
-        $this->attempts->finished($attempt, array_filter(
+        $this->safely('attempt log', fn () => $this->attempts->finished($attempt, array_filter(
             ['status' => $status, ...$outcome],
             static fn (mixed $value): bool => $value !== null,
-        ));
+        )));
     }
 
     private function path(string $suffix): string
