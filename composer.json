@@ -36,7 +36,8 @@
     },
     "suggest": {
         "guzzlehttp/guzzle": "Provides the PSR-18 client and PSR-17 factories the SDK discovers by default",
-        "illuminate/support": "Required to use the Laravel bridge under Sigilbase\\Laravel"
+        "illuminate/support": "Required to use the Laravel bridge under Sigilbase\\Laravel",
+        "ext-pdo_sqlite": "Required for Sigilbase\\Receipts\\SqliteReceiptStore"
     },
     "autoload": {
         "psr-4": {

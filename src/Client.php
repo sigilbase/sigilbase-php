@@ -7,14 +7,22 @@ namespace Sigilbase;
 use GuzzleHttp\Client as GuzzleClient;
 use GuzzleHttp\Psr7\HttpFactory;
 use InvalidArgumentException;
+use LogicException;
 use Psr\Http\Client\ClientInterface;
 use Psr\Http\Message\RequestFactoryInterface;
 use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Sigilbase\Dto\PublicKeySet;
+use Sigilbase\Dto\Receipt;
+use Sigilbase\Dto\ReceiptKeySet;
 use Sigilbase\Exceptions\MissingHttpClientException;
 use Sigilbase\Http\Transport;
+use Sigilbase\Receipts\AttemptLog;
+use Sigilbase\Receipts\FileReceiptStore;
+use Sigilbase\Receipts\ReceiptStore;
+use Sigilbase\Verify\ReceiptVerification;
+use Sigilbase\Verify\ReceiptVerifier;
 
 /**
  * The entry point. Create one per instance and API key, then address
@@ -28,11 +36,20 @@ final class Client
     /**
      * @internal use {@see Client::create()}; this constructor exists for tests.
      */
-    public function __construct(private readonly Transport $transport) {}
+    public function __construct(
+        private readonly Transport $transport,
+        private readonly ?ReceiptStore $receipts = null,
+        private readonly ?AttemptLog $attempts = null,
+    ) {}
 
     /**
      * Any PSR-18 client and PSR-17 factories work; when omitted, Guzzle is
      * used if it is installed.
+     *
+     * Every receipt the client is given goes to `receiptStore` (for example
+     * a {@see FileReceiptStore}), and every request it sends is recorded in
+     * `attemptLog` with its request digest: together they let you show what
+     * Sigilbase told you, and which requests it never answered.
      */
     public static function create(
         #[\SensitiveParameter] string $apiKey,
@@ -42,6 +59,8 @@ final class Client
         ?StreamFactoryInterface $streamFactory = null,
         ?LoggerInterface $logger = null,
         int $maxRetries = 3,
+        ?ReceiptStore $receiptStore = null,
+        ?AttemptLog $attemptLog = null,
     ): self {
         if (trim($apiKey) === '') {
             throw new InvalidArgumentException('The Sigilbase API key must not be empty.');
@@ -91,12 +110,12 @@ final class Client
             maxRetries: $maxRetries,
         );
 
-        return new self($transport);
+        return new self($transport, $receiptStore, $attemptLog);
     }
 
     public function stream(string $slug): StreamClient
     {
-        return new StreamClient($this->transport, $slug);
+        return new StreamClient($this->transport, $slug, $this->receipts, $this->attempts);
     }
 
     /**
@@ -108,5 +127,47 @@ final class Client
         $response = $this->transport->request('GET', '/api/v1/keys', authenticated: false);
 
         return PublicKeySet::fromObject($response->body);
+    }
+
+    /**
+     * The published receipt keys, retired ones included: unauthenticated,
+     * like the signing keys.
+     */
+    public function receiptKeys(): ReceiptKeySet
+    {
+        $response = $this->transport->request('GET', '/api/v1/receipt-keys', authenticated: false);
+
+        return ReceiptKeySet::fromObject($response->body);
+    }
+
+    /**
+     * Check a receipt's signature and key window against the published
+     * receipt keys (fetched when not given). The records it names are
+     * checked by the verifier, against bundles: php verify.php --receipt.
+     */
+    public function verifyReceipt(Receipt $receipt, ?ReceiptKeySet $keys = null): ReceiptVerification
+    {
+        return (new ReceiptVerifier)->verify($receipt, $keys ?? $this->receiptKeys());
+    }
+
+    /**
+     * Write every stored receipt into a directory, one document each, as
+     * the verifier's --reconcile --receipts reads them. Returns how many.
+     */
+    public function exportReceipts(string $directory): int
+    {
+        if ($this->receipts === null) {
+            throw new LogicException('This client keeps no receipts: create it with a receiptStore to export them.');
+        }
+
+        $export = new FileReceiptStore($directory);
+        $count = 0;
+
+        foreach ($this->receipts->all() as $receipt) {
+            $export->put($receipt);
+            $count++;
+        }
+
+        return $count;
     }
 }

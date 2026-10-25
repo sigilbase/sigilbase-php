@@ -17,6 +17,7 @@ use Sigilbase\Exceptions\AuthenticationException;
 use Sigilbase\Exceptions\EventNotSealedException;
 use Sigilbase\Exceptions\NotFoundException;
 use Sigilbase\Exceptions\RateLimitedException;
+use Sigilbase\Exceptions\RegistryNotReadyException;
 use Sigilbase\Exceptions\ServerException;
 use Sigilbase\Exceptions\SigilbaseException;
 use Sigilbase\Exceptions\StreamArchivedException;
@@ -60,6 +61,9 @@ final class Transport
     /**
      * @param  array<string, int|string>|null  $query
      * @param  array<string, mixed>|null  $body
+     * @param  list<int>  $passThrough  error statuses answered with their decoded body instead of an
+     *                                  exception, before any retry: a registry's recorded refusals, whose
+     *                                  receipts must be read from the body exactly as signed
      */
     public function request(
         string $method,
@@ -68,6 +72,7 @@ final class Transport
         ?array $body = null,
         bool $idempotent = true,
         bool $authenticated = true,
+        array $passThrough = [],
     ): ApiResponse {
         $uri = $this->baseUrl.$path;
 
@@ -97,6 +102,14 @@ final class Transport
             }
 
             $status = $response->getStatusCode();
+
+            if (in_array($status, $passThrough, true)) {
+                $decoded = $this->decodeObject($response);
+
+                if ($decoded !== null) {
+                    return new ApiResponse($status, $decoded, $this->retryAfterSeconds($response));
+                }
+            }
 
             if (($status === 429 || $status >= 500) && $canRetry) {
                 $this->backOff($attempt, $this->retryAfterSeconds($response), $method, $path, "HTTP {$status}");
@@ -142,15 +155,9 @@ final class Transport
 
     private function decodeSuccess(ResponseInterface $response, string $method, string $path): stdClass
     {
-        $raw = (string) $response->getBody();
+        $decoded = $this->decodeObject($response);
 
-        try {
-            $decoded = json_decode($raw, associative: false, flags: JSON_THROW_ON_ERROR);
-        } catch (JsonException) {
-            $decoded = null;
-        }
-
-        if (! $decoded instanceof stdClass) {
+        if ($decoded === null) {
             throw new UnexpectedResponseException(
                 "The response to [{$method} {$path}] was not a JSON object.",
                 $response->getStatusCode(),
@@ -158,6 +165,17 @@ final class Transport
         }
 
         return $decoded;
+    }
+
+    private function decodeObject(ResponseInterface $response): ?stdClass
+    {
+        try {
+            $decoded = json_decode((string) $response->getBody(), associative: false, flags: JSON_THROW_ON_ERROR);
+        } catch (JsonException) {
+            return null;
+        }
+
+        return $decoded instanceof stdClass ? $decoded : null;
     }
 
     private function mapError(int $status, ResponseInterface $response): SigilbaseException
@@ -183,6 +201,7 @@ final class Transport
             ),
             $status === 403 => new AccessDeniedException($message, 403, $body),
             $status === 404 => new NotFoundException($message, 404, $body),
+            $status === 409 && $code === 'registry_not_ready' => new RegistryNotReadyException($message, 409, $body),
             $status === 409 => new EventNotSealedException($message, 409, $body),
             $status === 410 => new StreamArchivedException(
                 'The stream is archived and permanently read-only (stream_archived).',
