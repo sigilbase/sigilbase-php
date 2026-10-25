@@ -125,7 +125,8 @@ final class StreamClient
      * Only what was not decided throws: an authentication failure, a
      * suspended workspace, a registry with no policy yet, or one that could
      * not decide. It is retried automatically only once this stream has
-     * answered as a registry, where a commitment key makes a submission safe
+     * answered this client as a registry (Client::stream() keeps one
+     * StreamClient per slug), where a commitment key makes a submission safe
      * to repeat.
      *
      * Sent to a stream that is not a registry, the commitment key is ignored

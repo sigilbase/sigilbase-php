@@ -22,6 +22,9 @@ follows semantic versioning.
 
 ### Fixed
 
+- `Client::stream()` keeps one `StreamClient` per slug, so a registry that
+  has answered once is retried on later commits however the stream is
+  addressed (`$client->stream('x')->commit(...)` each time no longer forgets).
 - A `409 commitment_conflict` on an append is `CommitmentConflictException`
   (with its decision and receipt), no longer `EventNotSealedException`.
 

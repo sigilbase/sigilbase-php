@@ -166,8 +166,9 @@ $result->receipt;      // kept in the receipt store too
 It throws only for what the registry did not decide: authentication, a
 suspended workspace, `RegistryNotReadyException` before a policy is committed,
 and a registry that could not decide. A commit is retried automatically only
-once the stream has answered this client as a registry, where a commitment key
-makes a submission safe to repeat; until then a lost answer is yours to retry.
+once the stream has answered this `Client` as a registry (the client remembers
+it per stream for its lifetime), where a commitment key makes a submission safe
+to repeat; until then, or in a fresh client, a lost answer is yours to retry.
 
 In Laravel, receipts go to `storage/sigilbase/receipts` and the attempt log to
 `storage/sigilbase/attempts.ndjson` by default (`config/sigilbase.php`,

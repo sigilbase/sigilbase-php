@@ -44,6 +44,15 @@ final class Client
     ) {}
 
     /**
+     * One StreamClient per slug, for the client's lifetime: what a stream
+     * has shown about itself (that it is a registry, which makes a commit
+     * safe to retry) holds however the caller addresses it.
+     *
+     * @var array<string, StreamClient>
+     */
+    private array $streams = [];
+
+    /**
      * Any PSR-18 client and PSR-17 factories work; when omitted, Guzzle is
      * used if it is installed.
      *
@@ -116,7 +125,7 @@ final class Client
 
     public function stream(string $slug): StreamClient
     {
-        return new StreamClient($this->transport, $slug, $this->receipts, $this->attempts, $this->logger);
+        return $this->streams[$slug] ??= new StreamClient($this->transport, $slug, $this->receipts, $this->attempts, $this->logger);
     }
 
     /**
