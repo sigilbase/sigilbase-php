@@ -19,6 +19,14 @@ interface AttemptLog
     public function started(array $attempt): void;
 
     /**
+     * One HTTP try of an attempt, retries included: its status, or the
+     * network error that kept it from getting one.
+     *
+     * @param  array<string, mixed>  $try
+     */
+    public function tried(string $attemptId, array $try): void;
+
+    /**
      * @param  array<string, mixed>  $outcome  status, outcome, decision_seq, receipt id, or error
      */
     public function finished(string $attemptId, array $outcome): void;

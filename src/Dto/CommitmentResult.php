@@ -30,7 +30,32 @@ final readonly class CommitmentResult
         public ?int $sequence,
         public ?string $entryHash,
         public ?int $retryAfter,
+        public bool $registry = true,
     ) {}
+
+    /**
+     * A commit sent to a stream that is not a registry: the key was
+     * ignored and the event appended (or replayed) like any other.
+     *
+     * @internal
+     */
+    public static function fromStandardAppend(int $status, stdClass $body): self
+    {
+        $receipt = Receipt::fromResponse($body);
+
+        return new self(
+            status: $status,
+            outcome: $receipt?->outcome() ?? ($status === 200 ? 'replay' : 'accepted'),
+            decisionSeq: null,
+            recorded: false,
+            receipt: $receipt,
+            reasons: [],
+            sequence: Json::nullableInt($body, 'sequence'),
+            entryHash: Json::nullableString($body, 'entry_hash'),
+            retryAfter: null,
+            registry: false,
+        );
+    }
 
     /**
      * @internal
