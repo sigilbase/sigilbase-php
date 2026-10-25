@@ -513,6 +513,12 @@ final class StreamClient
             ]);
 
             throw $exception;
+        } finally {
+            // The guard lives as long as the attempt: a client kept in a
+            // long-running worker holds nothing per request.
+            if ($attempt !== null) {
+                unset($this->finished[$attempt]);
+            }
         }
     }
 
