@@ -124,8 +124,10 @@ final class StreamClient
      * was decided, and the receipt is kept in the client's receipt store.
      * Only what was not decided throws: an authentication failure, a
      * suspended workspace, a registry with no policy yet, or one that could
-     * not decide (retried, as a commitment key makes a submission safe to
-     * repeat).
+     * not decide. It is retried automatically only once this stream has
+     * answered this client as a registry (Client::stream() keeps one
+     * StreamClient per slug), where a commitment key makes a submission safe
+     * to repeat.
      *
      * Sent to a stream that is not a registry, the commitment key is ignored
      * and the event is appended like any other: the result says so
