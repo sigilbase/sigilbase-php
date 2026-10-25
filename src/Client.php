@@ -40,6 +40,7 @@ final class Client
         private readonly Transport $transport,
         private readonly ?ReceiptStore $receipts = null,
         private readonly ?AttemptLog $attempts = null,
+        private readonly LoggerInterface $logger = new NullLogger,
     ) {}
 
     /**
@@ -110,12 +111,12 @@ final class Client
             maxRetries: $maxRetries,
         );
 
-        return new self($transport, $receiptStore, $attemptLog);
+        return new self($transport, $receiptStore, $attemptLog, $logger ?? new NullLogger);
     }
 
     public function stream(string $slug): StreamClient
     {
-        return new StreamClient($this->transport, $slug, $this->receipts, $this->attempts);
+        return new StreamClient($this->transport, $slug, $this->receipts, $this->attempts, $this->logger);
     }
 
     /**

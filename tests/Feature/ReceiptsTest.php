@@ -233,17 +233,33 @@ it('throws only for what a registry did not decide', function () {
     expect(fn () => keepingClient($http, $this->dir)->stream('filings')->commit('k', 'a', 'b', []))
         ->toThrow(RegistryNotReadyException::class);
 
+    // Until the stream has answered as a registry, a commit is not
+    // retried: on a standard stream a resubmission would append twice.
     $http = new FakeHttpClient;
+    $http->queue(jsonResponse(503, ['error' => 'registry_unavailable', 'message' => 'Retry.'], ['Retry-After' => '1']));
+
+    $client = keepingClient($http, $this->dir);
+
+    expect(fn () => $client->stream('filings')->commit('k', 'a', 'b', []))->toThrow(ServerException::class)
+        ->and($http->requests)->toHaveCount(1);
+
+    // Once it has, a commitment key makes a submission safe to repeat.
+    $http = new FakeHttpClient;
+    $http->queue(rawJsonResponse(201, json_encode([
+        'outcome' => 'accepted', 'id' => 'e1', 'sequence' => 1, 'entry_hash' => str_repeat('ab', 32),
+        'received_at' => '2026-07-01T09:10:00.000000Z', 'decision_seq' => 4, 'recorded' => true,
+        'receipt' => json_decode(receiptFixture('04-accepted.json')), 'receipt_pending' => false,
+    ])));
 
     foreach (range(1, 4) as $i) {
         $http->queue(jsonResponse(503, ['error' => 'registry_unavailable', 'message' => 'Retry.'], ['Retry-After' => '1']));
     }
 
-    expect(fn () => keepingClient($http, $this->dir)->stream('filings')->commit('k', 'a', 'b', []))
-        ->toThrow(ServerException::class);
+    $stream = keepingClient($http, $this->dir)->stream('filings');
+    $stream->commit('k', 'a', 'b', []);
 
-    // A commitment key makes a submission safe to repeat: retried.
-    expect($http->requests)->toHaveCount(4);
+    expect(fn () => $stream->commit('k2', 'a', 'b', []))->toThrow(ServerException::class)
+        ->and($http->requests)->toHaveCount(5);
 
     $lines = (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines();
 
@@ -327,7 +343,7 @@ it('keeps the receipt a registry signs for an append it refuses', function () {
         ->and($lines[count($lines) - 1]['status'])->toBe(422);
 });
 
-it('still ends the attempt when the receipt store cannot write', function () {
+it('never fails a decided request because the receipt store cannot write', function () {
     $http = new FakeHttpClient;
     $receipt = json_decode(receiptFixture('04-accepted.json'));
     $http->queue(rawJsonResponse(201, json_encode([
@@ -351,13 +367,18 @@ it('still ends the attempt when the receipt store cannot write', function () {
     $factory = new HttpFactory;
     $client = new Client(new Transport($http, $factory, $factory, 'https://sigilbase.test', 'sgb_x.y', sleeper: new FakeSleeper), $failing, new FileAttemptLog($this->dir.'/attempts.ndjson'));
 
-    expect(fn () => $client->stream('ledger')->append(actor: 'a', action: 'b', payload: []))->toThrow(RuntimeException::class, 'disk full');
+    // The append happened: the caller gets it, receipt in hand, and the
+    // store's failure is noted rather than thrown.
+    $appended = $client->stream('ledger')->append(actor: 'a', action: 'b', payload: []);
 
     $lines = (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines();
 
-    expect(array_column($lines, 'event'))->toBe(['started', 'tried', 'finished'])
+    expect($appended->sequence)->toBe(1)
+        ->and($appended->receipt)->not->toBeNull()
+        ->and(array_column($lines, 'event'))->toBe(['started', 'tried', 'tried', 'finished'])
         ->and($lines[1]['status'])->toBe(201)
-        ->and($lines[2]['error'])->toContain('disk full');
+        ->and($lines[2]['local_error'])->toContain('disk full')
+        ->and($lines[3]['sequence'])->toBe(1);
 });
 
 it('logs every try of an attempt, retries included', function () {
