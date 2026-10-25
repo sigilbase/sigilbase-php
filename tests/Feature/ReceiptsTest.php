@@ -255,11 +255,15 @@ it('throws only for what a registry did not decide', function () {
         $http->queue(jsonResponse(503, ['error' => 'registry_unavailable', 'message' => 'Retry.'], ['Retry-After' => '1']));
     }
 
-    $stream = keepingClient($http, $this->dir)->stream('filings');
-    $stream->commit('k', 'a', 'b', []);
+    // Addressed afresh each time, as the README does: the client keeps
+    // what the stream showed about itself.
+    $client = keepingClient($http, $this->dir);
+    $client->stream('filings')->commit('k', 'a', 'b', []);
 
-    expect(fn () => $stream->commit('k2', 'a', 'b', []))->toThrow(ServerException::class)
-        ->and($http->requests)->toHaveCount(5);
+    expect(fn () => $client->stream('filings')->commit('k2', 'a', 'b', []))->toThrow(ServerException::class)
+        ->and($http->requests)->toHaveCount(5)
+        ->and($client->stream('filings'))->toBe($client->stream('filings'))
+        ->and($client->stream('other'))->not->toBe($client->stream('filings'));
 
     $lines = (new FileAttemptLog($this->dir.'/attempts.ndjson'))->lines();
 
