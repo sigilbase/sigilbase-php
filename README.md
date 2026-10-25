@@ -111,6 +111,67 @@ When this passes, your CI has checked — on its own hardware, from the proof's 
 
 Honesty about limits is part of the guarantee, so, plainly: this proves the sealed event is exactly what you are reading now. It does not prove the event was true when written, and it does not by itself prove the stream has no *other* history — that is what [evidence bundles and consistency proofs](https://app.sigilbase.io/docs/verification) are for.
 
+## Receipts
+
+Every append is answered with a receipt: Sigilbase's signed statement of what
+it decided, made the moment it decided. Keep them. Give the client a receipt
+store and an attempt log, and every receipt is kept (refusals included) and
+every request recorded with its request digest:
+
+```php
+use Sigilbase\Receipts\FileAttemptLog;
+use Sigilbase\Receipts\FileReceiptStore;
+
+$client = Client::create(
+    apiKey: getenv('SIGILBASE_KEY'),
+    baseUrl: 'https://app.sigilbase.io',
+    receiptStore: new FileReceiptStore(__DIR__.'/storage/sigilbase/receipts'),   // or SqliteReceiptStore
+    attemptLog: new FileAttemptLog(__DIR__.'/storage/sigilbase/attempts.ndjson'),
+);
+
+$appended = $client->stream('admin-actions')->append(actor: 'user:42', action: 'role.granted', payload: ['role' => 'admin']);
+$appended->receipt;          // Sigilbase\Dto\Receipt, or null with $appended->receiptPending
+
+$client->verifyReceipt($appended->receipt)->valid;   // signature and key window, against /api/v1/receipt-keys
+$client->exportReceipts('/tmp/receipts');            // the directory `verify.php --reconcile --receipts` reads
+```
+
+The attempt log shows the requests that never got a receipt apart from the
+ones Sigilbase decided: no one can prove a request that never arrived, but you
+can show you sent it.
+
+A stream that rejects and records key reuse answers a conflicting append with
+`CommitmentConflictException`, carrying the decision's `decisionSeq` and its
+receipt.
+
+### Registries
+
+A registry stream accepts one commitment per key and decides, records and
+receipts every submission. `commit()` returns its decision; a refusal is a
+result to keep, not an exception:
+
+```php
+$result = $client->stream('filings-2026')->commit(
+    commitmentKey: 'acme-2026-q3',
+    actor: 'filer:acme',
+    action: 'filing.submitted',
+    payload: ['filing_hash' => 'sha256:9f86…'],
+);
+
+$result->outcome;      // accepted, replay, conflict, invalid, refused_early, refused_late, ...
+$result->decisionSeq;  // its record in the registry's decision log
+$result->receipt;      // kept in the receipt store too
+```
+
+It throws only for what the registry did not decide: authentication,
+`RegistryNotReadyException` before a policy is committed, and a registry that
+could not decide (retried first: a commitment key makes a submission safe to
+repeat).
+
+In Laravel, receipts go to `storage/sigilbase/receipts` and the attempt log to
+`storage/sigilbase/attempts.ndjson` by default (`config/sigilbase.php`,
+`receipts`).
+
 ## Retries and idempotency
 
 Networks fail after the server has committed. Set `idempotencyKey` to a value that identifies the event in your system and retries become safe: a replay returns the original event (`$event->replayed === true`, HTTP 200) and writes nothing.
