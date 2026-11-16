@@ -4,6 +4,22 @@ All notable changes to sigilbase-php are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package
 follows semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- A `409 commitment_conflict` is `CommitmentConflictException` wherever it is
+  met, not only on the append paths: the transport no longer maps every 409
+  without a known code to `EventNotSealedException`. `EventNotSealedException`
+  is now only the proof endpoint's 409 (which carries no error code); a 409
+  with an unknown code is `UnexpectedResponseException`.
+
+### Documentation
+
+- Retries and idempotency: an application-level retry must pass the original
+  `occurredAt`, which otherwise defaults to the current time and makes the
+  retry a key conflict on a stream that rejects and records key reuse.
+
 ## [0.2.0] - 2026-10-25
 
 ### Added

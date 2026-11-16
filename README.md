@@ -178,6 +178,8 @@ In Laravel, receipts go to `storage/sigilbase/receipts` and the attempt log to
 
 Networks fail after the server has committed. Set `idempotencyKey` to a value that identifies the event in your system and retries become safe: a replay returns the original event (`$event->replayed === true`, HTTP 200) and writes nothing.
 
+A retry must send the same event. The SDK's own retries resend the exact body, so they always replay cleanly. If your application retries by building a new `NewEvent` (or calling `append()` again), pass the original `occurredAt` explicitly: left out, it defaults to the current time, so the retry differs from the first attempt. On a stream that returns the original, that difference is invisible (`200`, the original event); on a stream that rejects and records key reuse, it is a `CommitmentConflictException`.
+
 The SDK retries automatically on 429 and 5xx — up to three times, with jittered exponential backoff, honouring `Retry-After` — but **only for requests that are safe to repeat**: reads, and appends that carry an idempotency key. An append without one is never retried automatically, because the SDK cannot know whether the first attempt landed. Set one.
 
 ## Error handling
@@ -192,6 +194,8 @@ Exceptions mirror the [API error catalogue](https://app.sigilbase.io/docs/sendin
 | `TenantSuspendedException` | 403 | Account suspended; ingestion refused, reads keep working |
 | `NotFoundException` | 404 | Unknown stream slug or sequence in your tenancy |
 | `EventNotSealedException` | 409 | Proof requested before the sealing run covered the event |
+| `CommitmentConflictException` | 409 | `commitment_conflict`: the idempotency key already belongs to an event with different content, on a stream that rejects and records key reuse; nothing was appended, and `->decisionSeq` and `->receipt` say where it was recorded |
+| `RegistryNotReadyException` | 409 | `registry_not_ready`: the registry has no committed policy yet |
 | `StreamArchivedException` | 410 | Write to an archived stream — permanent, read-only |
 | `ValidationException` | 422 | Field errors on `->errors`, keyed exactly as the API returns them |
 | `StreamPausedException` | 423 | Write to a paused stream — reversible, retry after resuming |
