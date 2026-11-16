@@ -13,7 +13,9 @@ use Psr\Http\Message\StreamFactoryInterface;
 use Psr\Log\LoggerInterface;
 use Psr\Log\NullLogger;
 use Sigilbase\Exceptions\AccessDeniedException;
+use Sigilbase\Dto\Receipt;
 use Sigilbase\Exceptions\AuthenticationException;
+use Sigilbase\Exceptions\CommitmentConflictException;
 use Sigilbase\Exceptions\EventNotSealedException;
 use Sigilbase\Exceptions\NotFoundException;
 use Sigilbase\Exceptions\RateLimitedException;
@@ -239,7 +241,15 @@ final class Transport
             $status === 403 => new AccessDeniedException($message, 403, $body),
             $status === 404 => new NotFoundException($message, 404, $body),
             $status === 409 && $code === 'registry_not_ready' => new RegistryNotReadyException($message, 409, $body),
-            $status === 409 => new EventNotSealedException($message, 409, $body),
+            // A key reused with different content, wherever the 409 is met.
+            // The append paths build a richer one with every batch conflict's
+            // receipt (StreamClient::conflict); this is the same exception
+            // from the body alone, so no path can mistake it for "not sealed".
+            $status === 409 && $code === 'commitment_conflict' => $this->commitmentConflict($message, $body),
+            // The proof endpoint's 409 carries no error code: the event is
+            // not sealed yet. Only that is EventNotSealedException.
+            $status === 409 && $code === null => new EventNotSealedException($message, 409, $body),
+            $status === 409 => new UnexpectedResponseException($message, 409, $body),
             $status === 410 => new StreamArchivedException(
                 'The stream is archived and permanently read-only (stream_archived).',
                 410,
@@ -255,6 +265,23 @@ final class Transport
             $status >= 500 => new ServerException($message, $status, $body),
             default => new UnexpectedResponseException($message, $status, $body),
         };
+    }
+
+    /**
+     * @param  array<string, mixed>  $body
+     */
+    private function commitmentConflict(string $message, array $body): CommitmentConflictException
+    {
+        $object = json_decode((string) json_encode($body), associative: false);
+        $receipt = $object instanceof stdClass ? Receipt::fromResponse($object) : null;
+
+        return new CommitmentConflictException(
+            $message,
+            $body,
+            is_int($body['decision_seq'] ?? null) ? $body['decision_seq'] : null,
+            $receipt,
+            $receipt === null ? [] : [$receipt],
+        );
     }
 
     /**

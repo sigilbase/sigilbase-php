@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Sigilbase\Exceptions\AccessDeniedException;
 use Sigilbase\Exceptions\AuthenticationException;
+use Sigilbase\Exceptions\CommitmentConflictException;
 use Sigilbase\Exceptions\EventNotSealedException;
 use Sigilbase\Exceptions\NotFoundException;
 use Sigilbase\Exceptions\RateLimitedException;
@@ -74,6 +75,37 @@ it('maps 409 event not sealed yet', function () {
         ['message' => 'This event has not been sealed into a checkpoint yet; try again after the next sealing run.'],
         EventNotSealedException::class,
     );
+});
+
+it('maps 409 commitment_conflict to its own exception, never to not sealed', function () {
+    expectMappedException(
+        409,
+        [
+            'error' => 'commitment_conflict',
+            'message' => 'This idempotency key already belongs to an event with different content.',
+            'decision_seq' => 4,
+            'accepted' => ['sequence' => 12, 'entry_hash' => str_repeat('8c', 32)],
+        ],
+        CommitmentConflictException::class,
+    );
+});
+
+it('carries the decision sequence on a commitment conflict met outside the append path', function () {
+    $http = new FakeHttpClient;
+    $http->queue(jsonResponse(409, ['error' => 'commitment_conflict', 'message' => 'Reused.', 'decision_seq' => 4]));
+
+    try {
+        fakeClient($http, maxRetries: 0)->stream('admin-actions')->event(1);
+        test()->fail('Expected CommitmentConflictException.');
+    } catch (CommitmentConflictException $conflict) {
+        expect($conflict->decisionSeq)->toBe(4)
+            ->and($conflict->receipt)->toBeNull()
+            ->and($conflict)->not->toBeInstanceOf(EventNotSealedException::class);
+    }
+});
+
+it('maps a 409 with an unknown error code to an unexpected response, not to not sealed', function () {
+    expectMappedException(409, ['error' => 'something_new', 'message' => 'New.'], UnexpectedResponseException::class);
 });
 
 it('maps 410 stream_archived', function () {
