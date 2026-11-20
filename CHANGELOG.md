@@ -4,7 +4,7 @@ All notable changes to sigilbase-php are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the package
 follows semantic versioning.
 
-## [Unreleased]
+## [0.2.1] - 2026-11-20
 
 ### Fixed
 
@@ -78,5 +78,6 @@ First release.
 - Laravel bridge: auto-discovered service provider, publishable
   `config/sigilbase.php`, optional facade.
 
+[0.2.1]: https://github.com/sigilbase/sigilbase-php/releases/tag/v0.2.1
 [0.2.0]: https://github.com/sigilbase/sigilbase-php/releases/tag/v0.2.0
 [0.1.0]: https://github.com/sigilbase/sigilbase-php/releases/tag/v0.1.0
